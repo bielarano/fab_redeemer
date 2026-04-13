@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FAB Free Auto Redeemer
 // @namespace    https://wendystudios.com
-// @version      1.0.0
+// @version      1.1.0
 // @description  Detect free assets on fab.com, hide already-owned ones, and auto-redeem unclaimed free assets with the best license.
 // @author       WendyStudios
 // @match        https://www.fab.com/*
@@ -813,6 +813,9 @@
         container = parent;
       }
 
+      // Skip cards already hidden by this script
+      if (container.dataset.farHidden === 'true') return;
+
       // Try to extract a name
       let name = '';
       const titleEl = container.querySelector('h2, h3, [class*="title"], [class*="name"]');
@@ -827,15 +830,25 @@
   }
 
   function isCardLikelyFree(card) {
-    // Check URL for free filter
-    if (window.location.search.includes('is_free=true') || window.location.search.includes('price=free')) {
+    // Check URL for free filter (is_free=1 or is_free=true or price=free)
+    const qs = window.location.search;
+    if (qs.includes('is_free=') || qs.includes('price=free')) {
       return true;
     }
-    // Check card text for "Free" badge
+    // Check for "Free" text in the price area (class csZFzinF) or general card text
     const text = card.el.textContent || '';
     if (/\bfree\b/i.test(text)) return true;
-    // Check for price == 0 or "$ 0" patterns
     if (/\$\s*0(\.00)?/.test(text)) return true;
+    return false;
+  }
+
+  function isCardOwnedInDOM(card) {
+    // Detect "Saved in My Library" directly from card DOM — no API needed
+    const el = card.el;
+    // Check for the success intent class with check icon (cUUvxo_s or intent-success)
+    if (el.querySelector('.cUUvxo_s') || el.querySelector('[class*="intent-success"]')) return true;
+    // Check for "Saved in My Library" text
+    if ((el.textContent || '').includes('Saved in My Library')) return true;
     return false;
   }
 
@@ -853,10 +866,42 @@
     }
   }
 
-  function applyHidePass(freeCards) {
+  function scanAllCards() {
+    // Like scanVisibleCards but includes hidden ones — used for hide/show passes
+    const cards = [];
+    const seen = new Set();
+    const links = document.querySelectorAll('a[href*="/listings/"]');
+
+    links.forEach((link) => {
+      const id = extractListingId(link.getAttribute('href'));
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+
+      let container = link;
+      for (let i = 0; i < 8; i++) {
+        if (!container.parentElement) break;
+        const parent = container.parentElement;
+        if (parent.children.length > 3) break;
+        container = parent;
+      }
+
+      let name = '';
+      const titleEl = container.querySelector('h2, h3, [class*="title"], [class*="name"]');
+      if (titleEl) name = titleEl.textContent.trim();
+      if (!name) name = link.textContent.trim().substring(0, 60) || id.substring(0, 12);
+
+      cards.push({ id, name, el: container, link });
+    });
+
+    return cards;
+  }
+
+  function applyHidePass(allCards) {
     let hiddenCount = 0;
     let visibleCount = 0;
-    freeCards.forEach((c) => {
+    allCards.forEach((c) => {
+      const free = isCardLikelyFree(c);
+      if (!free) return;
       const owned = state.ownershipCache.get(c.id);
       if (owned && state.config.hideOwnedAssets) {
         hideCard(c);
@@ -873,8 +918,15 @@
 
   async function syncOwnedAndHideVisibleCards() {
     setStatus('Syncing ownership states...');
-    const cards = scanVisibleCards();
-    const freeCards = cards.filter(isCardLikelyFree);
+    const allCards = scanAllCards();
+    const freeCards = allCards.filter(isCardLikelyFree);
+
+    // DOM-based ownership: detect "Saved in My Library" directly, cache immediately
+    freeCards.forEach((c) => {
+      if (!state.ownershipCache.has(c.id) && isCardOwnedInDOM(c)) {
+        state.ownershipCache.set(c.id, true);
+      }
+    });
 
     // Pre-hide candidates if configured
     if (state.config.prehideCandidates) {
@@ -882,13 +934,16 @@
     }
 
     // Immediately hide any already-cached owned cards before network calls
-    applyHidePass(freeCards);
+    applyHidePass(allCards);
 
-    const ids = freeCards.map((c) => c.id);
-    await checkOwnershipBulk(ids);
+    // Only query API for cards NOT already detected as owned from DOM
+    const idsToCheck = freeCards.filter((c) => !state.ownershipCache.has(c.id)).map((c) => c.id);
+    if (idsToCheck.length > 0) {
+      await checkOwnershipBulk(idsToCheck);
+    }
 
     // Final pass after all ownership data is in
-    applyHidePass(freeCards);
+    applyHidePass(allCards);
     setStatus('Ready');
   }
 
@@ -972,7 +1027,14 @@
     const freeCards = cards.filter(isCardLikelyFree);
     const candidates = freeCards.filter((c) => !state.ownershipCache.get(c.id));
     const total = candidates.length;
+
+    if (total === 0) {
+      addLog('No candidates to process in current view', 'info');
+      return 0;
+    }
+
     let idx = 0;
+    let claimed = 0;
 
     for (const card of candidates) {
       if (!state.running) break;
@@ -982,10 +1044,12 @@
       setStatus('Processing: ' + card.name);
       setProgress((idx / total) * 100);
 
-      // Re-check ownership (may have been updated)
-      if (state.ownershipCache.get(card.id)) {
+      // Re-check ownership (cache or DOM)
+      if (state.ownershipCache.get(card.id) || isCardOwnedInDOM(card)) {
+        state.ownershipCache.set(card.id, true);
         state.stats.skipped++;
         addLog('Skipped already owned: ' + card.name, 'warn');
+        if (state.config.hideOwnedAssets) hideCard(card);
         updateStats();
         continue;
       }
@@ -1027,6 +1091,7 @@
           addLog('Already owned (conflict): ' + card.name, 'warn');
         } else {
           state.stats.added++;
+          claimed++;
           addLog('Added: ' + card.name, 'success');
         }
         state.ownershipCache.set(card.id, true);
@@ -1040,48 +1105,39 @@
       await sleep(state.config.delayBetweenClaims);
     }
 
-    // Auto-scroll
-    if (state.running && state.config.autoScroll) {
-      await autoScrollLoop();
-    }
+    return claimed;
   }
 
   /* ================================================================
      12. AUTO-SCROLL
      ================================================================ */
 
-  async function autoScrollLoop() {
-    let idleRounds = 0;
-    while (state.running && idleRounds < state.config.maxIdleScrollRounds) {
-      const prevCount = state.scannedCards.length;
-      setStatus('Scrolling for more results...');
-
-      window.scrollTo(0, document.body.scrollHeight);
-      await sleep(state.config.scrollDelay);
-
-      // Small adjustment scroll to trigger lazy loading
-      window.scrollBy(0, -200);
-      await sleep(500);
-      window.scrollBy(0, 250);
-      await sleep(state.config.scrollDelay);
-
-      const newCards = scanVisibleCards();
-      if (newCards.length > prevCount) {
-        idleRounds = 0;
-        addLog('Found ' + (newCards.length - prevCount) + ' new cards after scroll', 'info');
-        // Sync ownership for new cards
-        await syncOwnedAndHideVisibleCards();
-        // Process new candidates
-        await processLoop();
-      } else {
-        idleRounds++;
-        addLog('No new cards found (idle round ' + idleRounds + '/' + state.config.maxIdleScrollRounds + ')', 'warn');
-      }
+  async function tryScrollForMore() {
+    // Check if page is actually scrollable
+    if (document.documentElement.scrollHeight <= window.innerHeight + 50) {
+      addLog('Page is not scrollable, skipping auto-scroll', 'info');
+      return false;
     }
 
-    if (idleRounds >= state.config.maxIdleScrollRounds) {
-      addLog('Auto-scroll finished: no more results', 'info');
+    const prevCount = scanVisibleCards().length;
+    setStatus('Scrolling for more results...');
+
+    // Scroll to bottom
+    window.scrollTo(0, document.documentElement.scrollHeight);
+    await sleep(state.config.scrollDelay);
+
+    // Small adjustment to trigger lazy-load observers
+    window.scrollBy(0, -150);
+    await sleep(400);
+    window.scrollBy(0, 200);
+    await sleep(state.config.scrollDelay);
+
+    const newCount = scanVisibleCards().length;
+    if (newCount > prevCount) {
+      addLog('Found ' + (newCount - prevCount) + ' new cards after scroll', 'info');
+      return true;
     }
+    return false;
   }
 
   /* ================================================================
@@ -1102,8 +1158,37 @@
     setStatus('Starting...');
 
     try {
-      await syncOwnedAndHideVisibleCards();
-      await processLoop();
+      // --- Main loop: process visible → optionally scroll → repeat ---
+      let idleScrollRounds = 0;
+
+      while (state.running) {
+        // 1. Sync ownership & hide
+        await syncOwnedAndHideVisibleCards();
+        if (!state.running) break;
+
+        // 2. Process all visible candidates
+        const claimed = await processLoop();
+        if (!state.running) break;
+
+        // 3. If auto-scroll disabled, we're done
+        if (!state.config.autoScroll) break;
+
+        // 4. Try to scroll for more content
+        const gotMore = await tryScrollForMore();
+        if (!state.running) break;
+
+        if (gotMore) {
+          idleScrollRounds = 0;
+          // Loop back to process new cards
+        } else {
+          idleScrollRounds++;
+          addLog('No new cards after scroll (idle ' + idleScrollRounds + '/' + state.config.maxIdleScrollRounds + ')', 'warn');
+          if (idleScrollRounds >= state.config.maxIdleScrollRounds) {
+            addLog('Auto-scroll finished: no more results', 'info');
+            break;
+          }
+        }
+      }
     } catch (e) {
       addLog('Unexpected error: ' + e.message, 'error');
     }
